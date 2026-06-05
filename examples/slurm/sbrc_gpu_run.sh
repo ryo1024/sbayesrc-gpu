@@ -27,7 +27,9 @@
 #SBATCH --error=slurm/logs/sbrc_gpu_%j.err
 
 set -euo pipefail
-cd /mnt/data/artifacts/ryo/glm_stat_gen/glm_finemapping
+# Set REPO_ROOT to wherever your cluster-side data + binaries live.
+# Example: REPO_ROOT=/path/to/your/sbrc-work sbatch examples/slurm/sbrc_gpu_run.sh A_sbrc height
+cd "${REPO_ROOT:?REPO_ROOT must be set to the cluster-side working directory}"
 
 CONDITION="${1:?condition arg required (e.g. A_sbrc)}"
 TRAIT="${2:?trait arg required (e.g. height)}"

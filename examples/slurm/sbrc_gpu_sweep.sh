@@ -11,7 +11,8 @@
 # autonomous research GPU work.
 
 set -euo pipefail
-cd /mnt/data/artifacts/ryo/glm_stat_gen/glm_finemapping
+# Set REPO_ROOT to wherever your cluster-side data + binaries live.
+cd "${REPO_ROOT:?REPO_ROOT must be set to the cluster-side working directory}"
 
 CONDITIONS="${CONDITIONS:-A_sbrc B_sbrc K_sbrc}"
 TRAITS="${TRAITS:-height ldl}"

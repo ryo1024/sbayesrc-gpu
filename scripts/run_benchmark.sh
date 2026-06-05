@@ -1,16 +1,18 @@
 #!/bin/bash
-# Reproduce the published 1.94× benchmark.
+# Reproduce the published 5.04× SBayesRC benchmark on UKB-EUR-Imputed.
 #
 # Requires:
-#  - Patched gctb binary built with USE_GPU=1 (see README.md)
-#  - Eigen-decomposed LD reference at $LDREF (ukbEUR_Imputed)
+#  - Patched gctb binary built with USE_GPU=1 (see README.md "How to build")
+#  - Eigen-decomposed LD reference at $LDREF (e.g. ukbEUR_Imputed)
 #  - rsq0.5.pwld inside the LD ref directory
 #  - A trait .ma file at $MA_FILE
 #  - An annotation .txt file at $ANNOT_FILE
+#  - gene-map .txt file at $GMAP
 #
 # Reproduces:
-#  - SBayesRC on (height × A_sbrc baseline-LF) with 4 chains × 2000 iter
-#  - Expected wall on one H100 80 GB: ~7h with default flags, ~5h with SBRC_SKIP_FINDBEST=1
+#  - SBayesRC with 4 chains × 2000 iter on (height × A_sbrc baseline-LF).
+#  - Expected wall on one H100 80 GB with the full stack enabled: ~2h 40m.
+#  - CPU baseline on a 64-core Xeon (no GPU) for the same config: ~13h 40m.
 
 set -euo pipefail
 
@@ -32,7 +34,8 @@ echo "[$(date)] Starting GPU SBayesRC: $NUM_CHAINS chains × $CHAIN_LENGTH iter"
 echo
 
 time SBRC_GPU_R=${SBRC_GPU_R:-1} \
-     SBRC_SKIP_FINDBEST=${SBRC_SKIP_FINDBEST:-0} \
+     SBRC_GPU_GIBBS=${SBRC_GPU_GIBBS:-1} \
+     SBRC_SKIP_FINDBEST=${SBRC_SKIP_FINDBEST:-1} \
      "$GCTB" \
         --gwfm RC \
         --use-gpu \

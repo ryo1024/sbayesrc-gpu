@@ -91,10 +91,13 @@ enable the GPU dispatch. Environment variables for finer control:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `--use-gpu` (CLI flag) | off | Master switch: route the inner Gibbs sweep through CUDA |
-| `SBRC_GPU_R=1` | off | Also route the pass-1 `ApproxBayesR` sampler (used by `--num-chains>1`) through GPU. Validated within MC noise; adds ~10-15% more speedup. |
-| `SBRC_SKIP_FINDBEST=1` | off | Skip `findBestFitModel` auto-selection of `ndist`. Saves ~6-10 min at full Imputed. **Changes the chain initialization — use only when `ndist` is already calibrated for your trait.** |
+| `--use-gpu` (CLI flag) | off | Master switch: route the inner Gibbs sweep through CUDA. |
+| `SBRC_GPU_R=1` | off | Also route the pass-1 `ApproxBayesR` sampler (used by `--num-chains>1`) through GPU. Validated within MC noise. |
+| `SBRC_GPU_GIBBS=1` | off | Route the 188-annotation Gibbs sweep through cuBLAS `sdot`/`saxpy` with host-side RNG matching CPU `snorm()`. Validated within MC noise. |
+| `SBRC_SKIP_FINDBEST=1` | off | Skip `findBestFitModel` auto-selection of `ndist`. Saves ~6-10 min at full Imputed. **Changes chain initialization — use only when `ndist` is already calibrated for your trait.** |
 | `SBRC_GPU_DEVICE=N` | 0 | Select GPU N (for multi-GPU machines or MPS). |
+
+Pass `SBRC_GPU_R=1 SBRC_GPU_GIBBS=1 SBRC_SKIP_FINDBEST=1` to reproduce the 5.04× headline number.
 
 ### Example command
 
@@ -115,10 +118,12 @@ SBRC_GPU_R=1 SBRC_SKIP_FINDBEST=1 ./gctb \
     --out results/sbrc
 ```
 
-A SLURM script for production use is at `scripts/phase_sbrc_gpu_run.sh`.
+For a one-shot reproduction of the headline benchmark see
+[`scripts/run_benchmark.sh`](scripts/run_benchmark.sh).
 
-A sweep launcher for the typical "many traits × many conditions" workflow is at
-`scripts/phase_sbrc_gpu_sweep.sh`.
+Example SLURM scripts (the exact ones we used internally) live in
+[`examples/slurm/`](examples/slurm/) — they need light adaptation to your
+filesystem layout and cluster QoS.
 
 ## Memory requirements
 
@@ -157,14 +162,13 @@ If you use this in published work, please cite both:
 
 ## Status / known limitations
 
-- **`ApproxBayesR` GPU hook** (the pass-1 sampler used by `--num-chains>1`)
-  produces statistically equivalent output at chr22 + full-Imputed, but is gated
-  behind `SBRC_GPU_R=1` because it triggered a subtle memory bug in earlier
-  versions. Use the flag if you want the extra ~10% speedup; the default is
-  conservative.
-- **Annotation Gibbs sweep on GPU** is sketched in `sbrc_gpu.cu` but currently
-  disabled. Two attempts to enable it produced a post-MCMC segfault that needs
-  cuda-gdb debugging. The current build runs that piece on CPU.
+- **`ApproxBayesR` GPU hook** (the pass-1 sampler used by `--num-chains>1`) is
+  validated within MC noise at chr22 + full-Imputed, but gated behind
+  `SBRC_GPU_R=1` because earlier revisions triggered a subtle memory bug. Set
+  the flag in production for the full speedup; the default is conservative.
+- **Annotation Gibbs sweep on GPU** is implemented via cuBLAS `sdot`/`saxpy`
+  with host-side RNG matching CPU `snorm()`. Gated behind `SBRC_GPU_GIBBS=1`.
+  Together with the rest of the stack it produces the 5.04× headline.
 - **`SBRC_SKIP_FINDBEST=1`** uses your provided `--gamma`/`--pis` directly
   instead of auto-selecting via `findBestFitModel`. Saves time but changes chain
   initialization — calibrate `ndist`/`gamma` before using.
@@ -174,6 +178,6 @@ If you use this in published work, please cite both:
 ## Acknowledgments
 
 Built on top of GCTB 2.5.5 by Jian Zeng's lab. SBayesRC algorithm by Zheng,
-Yengo, Zhao, Wang et al. This repo packages GPU acceleration as a 490-line patch
-plus ~1500 lines of CUDA kernels; the core science remains the published
+Yengo, Zhao, Wang et al. This repo packages GPU acceleration as a ~550-line patch
+plus ~1400 lines of CUDA kernels; the core science remains the published
 SBayesRC method.
