@@ -23,6 +23,9 @@ slurm-*.err
 boost*/
 eigen*/
 
+# Test binaries
+tests/test_compare_pip_nan
+
 # Editor
 *.swp
 .DS_Store

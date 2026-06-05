@@ -20,10 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Build GCTB with GPU patch.
-# Pin GCTB to a known commit so the patch applies cleanly.
+# Pinned to the SHA the patch was generated against. If you bump this, regenerate
+# the patch (see CONTRIBUTING.md) and re-run tests/test_patch_applies.sh.
+ARG GCTB_SHA=cc7fa7d765c83a89c6375946cf77fe50ba1a317e
 WORKDIR /opt
 RUN git clone https://github.com/jianzeng/GCTB.git GCTB && \
-    cd GCTB && git checkout master   # pin a specific SHA in production
+    cd GCTB && git checkout "${GCTB_SHA}"
 
 # Copy the GPU patch + dispatch sources.
 COPY src/gctb-gpu-patch.patch  /opt/sbayesrc-gpu/
