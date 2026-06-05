@@ -1,0 +1,545 @@
+diff --git a/scr/Makefile b/scr/Makefile
+index 21288a4..48dca4f 100644
+--- a/scr/Makefile
++++ b/scr/Makefile
+@@ -1,30 +1,47 @@
+-# Makefile for gctb
++# Makefile for gctb (+ Phase 2 GPU dispatch)
+ # Supported platforms: UNIX/Linux, macOS
+ 
+-# Set the output filename
+ OUTPUT = gctb
+ 
+-# Set the path to dependent libraries
++# Header-only deps; set via env or pass on cmdline
+ EIGEN_PATH = $(EIGEN3_INCLUDE_DIR)
+ BOOST_PATH = $(BOOST_LIB)
+ 
+-# Set the C++ compiler based on the system
++# GPU support: set USE_GPU=1 to build with --use-gpu dispatch. Requires nvcc on PATH.
++USE_GPU ?= 0
++ifeq ($(USE_GPU),1)
++    CUDA_HOME ?= /usr/local/cuda
++    NVCC = $(CUDA_HOME)/bin/nvcc
++    GPU_ARCH ?= sm_90
++    NVCCFLAGS = -O3 -std=c++17 -arch=$(GPU_ARCH) \
++                -Xcompiler="-O3 -march=native -fopenmp" \
++                -I $(EIGEN_PATH) -I $(BOOST_PATH)
++    GPU_LIBS = -L$(CUDA_HOME)/lib64 -lcudart -lcurand -lcublas
++    GPU_DEFS = -DGCTB_GPU=1
++    GPU_OBJ = sbrc_gpu.o
++    # CUDA include dir needed by main.cpp (cudaSetDevice in SBRC_GPU_DEVICE handling)
++    GPU_INC = -I$(CUDA_HOME)/include
++else
++    GPU_OBJ =
++    GPU_LIBS =
++    GPU_DEFS =
++    GPU_INC =
++endif
++
+ ifeq ($(shell uname -s),Linux)
+     CXX = g++
+-    CXXFLAGS = -I $(EIGEN_PATH) -I $(BOOST_PATH) -DUNIX -DNDEBUG -msse2 -m64 -fopenmp -O3 -std=c++0x -Wall -w
+-    LIB = -ldl
++    CXXFLAGS = -I $(EIGEN_PATH) -I $(BOOST_PATH) $(GPU_INC) -DUNIX -DNDEBUG -march=native -O3 -ffast-math -fopenmp -std=c++0x -Wall -w $(GPU_DEFS)
++    LIB = $(GPU_LIBS) -ldl
+ else ifeq ($(shell uname -s),Darwin)
+     CXX = /opt/homebrew/opt/llvm/bin/clang++
+-    CXXFLAGS = -I /usr/local/include -I $(EIGEN_PATH) -I $(BOOST_PATH) -DUNIX -Dfopen64=fopen -stdlib=libc++ -m64 -fopenmp -O3 -std=c++0x -Wall -w
+-    LIB = -lz -lm -L/usr/local/opt/libomp/lib
++    CXXFLAGS = -I /usr/local/include -I $(EIGEN_PATH) -I $(BOOST_PATH) $(GPU_INC) -DUNIX -Dfopen64=fopen -stdlib=libc++ -m64 -fopenmp -O3 -std=c++0x -Wall -w $(GPU_DEFS)
++    LIB = $(GPU_LIBS) -lz -lm -L/usr/local/opt/libomp/lib
+ endif
+ 
+-# Set the source files and headers
+-HDR = gctb.hpp data.hpp gadgets.hpp hsq.hpp mcmc.hpp model.hpp options.hpp stat.hpp vgmaf.hpp predict.hpp xci.hpp stratify.hpp multichain.hpp
++HDR = gctb.hpp data.hpp gadgets.hpp hsq.hpp mcmc.hpp model.hpp options.hpp stat.hpp vgmaf.hpp predict.hpp xci.hpp stratify.hpp multichain.hpp sbrc_gpu.hpp
+ SRC = gctb.cpp data.cpp gadgets.cpp hsq.cpp main.cpp mcmc.cpp model.cpp options.cpp stat.cpp vgmaf.cpp predict.cpp xci.cpp stratify.cpp eigen.cpp multichain.cpp
+-OBJ = $(SRC:.cpp=.o)
++OBJ = $(SRC:.cpp=.o) $(GPU_OBJ)
+ 
+-# Define the rules
+ .PHONY: all clean
+ 
+ all: $(OUTPUT)
+@@ -35,5 +52,8 @@ $(OUTPUT): $(OBJ)
+ %.o: %.cpp $(HDR)
+ 	$(CXX) $(CXXFLAGS) -c $< -o $@
+ 
++sbrc_gpu.o: sbrc_gpu.cu sbrc_gpu.hpp data.hpp
++	$(NVCC) $(NVCCFLAGS) -c sbrc_gpu.cu -o sbrc_gpu.o
++
+ clean:
+ 	rm -f $(OBJ) $(OUTPUT) *~
+diff --git a/scr/gctb.cpp b/scr/gctb.cpp
+index bd85838..6667626 100644
+--- a/scr/gctb.cpp
++++ b/scr/gctb.cpp
+@@ -1509,8 +1509,18 @@ float GCTB::tuneEigenCutoff(Data &data, const Options &opt){
+         
+         cout << boost::format("%10s %25s %20s\n") % cutoff % cor[i] % rel[i];
+ 
++        // Lifecycle fix (phase 2): release the per-cutoff model and MCMC samples so
++        // the SnpEffects destructor fires and any GPU state (refcount on d_Q etc.)
++        // is freed before the next cutoff allocates new Q. Without this, on
++        // --use-gpu SBRC_GPU_R=1 the 70-GB Q from cutoff i is still resident when
++        // cutoff i+1 tries to allocate, OOMing the H100.
++        delete modeli;
++        for (unsigned k = 0; k < mcmcSampleVeci.size(); ++k) {
++            delete mcmcSampleVeci[k];
++        }
++        mcmcSampleVeci.clear();
+     }
+-    
++
+     data.nGWASblock = nGWASblock;
+     
+     int bestCutoff_index;
+diff --git a/scr/gctb.hpp b/scr/gctb.hpp
+index b3ce7b3..0198d06 100644
+--- a/scr/gctb.hpp
++++ b/scr/gctb.hpp
+@@ -82,8 +82,24 @@ public:
+     //void calcCredibleSets(Data &data, const string &snpResFile, McmcSamples &snpEffects, const string &eigenMatrixFile, const float eigenCutoff, const float pipThreshold, const string &title);
+     void calcCredibleSets(Data &data, McmcSamples &snpEffects, const float pipThreshold, const float pepThreshold, const string &title);
+ 
++    // NaN-tolerant PIP comparator. The whole codebase is compiled with -ffast-math
++    // (-ffinite-math-only), which makes the compiler assume no operand is ever
++    // NaN and silently optimize away "a != a" and isnan(a). We therefore detect
++    // NaN by raw IEEE-754 bit pattern (exp=0xff, mantissa!=0) via memcpy, which
++    // the optimizer cannot constant-fold. NaN PIPs would otherwise violate
++    // strict weak ordering and crash libstdc++ introsort inside calcCredibleSets.
++    __attribute__((optimize("no-finite-math-only")))
+     static bool comparePIP(const SnpInfo* snpi, const SnpInfo* snpj){
+-        return snpi->pip > snpj->pip;
++        float a = snpi->pip, b = snpj->pip;
++        unsigned ai, bi;
++        __builtin_memcpy(&ai, &a, sizeof(ai));
++        __builtin_memcpy(&bi, &b, sizeof(bi));
++        bool an = ((ai & 0x7f800000u) == 0x7f800000u) && (ai & 0x7fffffu);
++        bool bn = ((bi & 0x7f800000u) == 0x7f800000u) && (bi & 0x7fffffu);
++        if (an && bn) return false;
++        if (an) return false;
++        if (bn) return true;
++        return a > b;
+     };
+     
+     static bool compareCS(const CredibleSetInfo* csi, const CredibleSetInfo* csj){
+diff --git a/scr/main.cpp b/scr/main.cpp
+index fa02238..9fe4011 100644
+--- a/scr/main.cpp
++++ b/scr/main.cpp
+@@ -7,9 +7,12 @@
+ //
+ 
+ #include <iostream>
++#include <cstdlib>
++#include <cuda_runtime.h>
+ #include "gctb.hpp"
+ #include "xci.hpp"
+ #include "vgmaf.hpp"
++#include "sbrc_gpu.hpp"
+ 
+ using namespace std;
+ 
+@@ -37,6 +40,22 @@ int main(int argc, const char * argv[]) {
+         
+         Options opt;
+         opt.inputOptions(argc, argv);
++
++        // Phase-2: set the GPU dispatch flag for ApproxBayesRC::SnpEffects::sampleFromFC_eigen
++        sbrc_gpu_enabled = opt.useGpu;
++        if (sbrc_gpu_enabled) {
++            cout << "[sbrc_gpu] --use-gpu enabled\n";
++            // Multi-GPU plumbing: SBRC_GPU_DEVICE selects which GPU to use. Default 0.
++            const char* dev_env = std::getenv("SBRC_GPU_DEVICE");
++            if (dev_env) {
++                int dev = std::atoi(dev_env);
++                if (cudaSetDevice(dev) == cudaSuccess) {
++                    cout << "[sbrc_gpu] SBRC_GPU_DEVICE=" << dev << " selected\n";
++                } else {
++                    cout << "[sbrc_gpu] WARNING: cudaSetDevice(" << dev << ") failed, using default GPU\n";
++                }
++            }
++        }
+         
+         if (opt.seed) Stat::seedEngine(opt.seed);
+         else          Stat::seedEngine(011415);  // fix the random seed if not given due to the use of MPI
+@@ -243,7 +262,18 @@ int main(int argc, const char * argv[]) {
+ //            } else {
+                 
+             
+-            if (opt.nDistAuto) gctb.findBestFitModel(data, opt);
++            // Phase 2: SBRC_SKIP_FINDBEST=1 short-circuits findBestFitModel, which is the
++            // 4-model × 500-iter comparison phase used to auto-select numDist. This is fine
++            // for production runs where numDist has already been calibrated (the typical
++            // SBayesRC paper config uses ndist=5). Saves ~15-30 min per chain at full Imputed.
++            if (opt.nDistAuto) {
++                const char* skip = std::getenv("SBRC_SKIP_FINDBEST");
++                if (skip && std::atoi(skip) != 0) {
++                    std::cout << "[sbrc_gpu] SBRC_SKIP_FINDBEST=1 → skipping findBestFitModel (using --gamma/--pis as-is)\n";
++                } else {
++                    gctb.findBestFitModel(data, opt);
++                }
++            }
+             
+             Model *model = gctb.buildModel(data, opt, opt.bedFile, opt.gwasSummaryFile, opt.bayesType, opt.windowWidth,
+                                            opt.heritability, opt.propVarRandom, opt.pi, opt.piAlpha, opt.piBeta, opt.estimatePi, opt.noscale, opt.pis, opt.piPar, opt.gamma, opt.estimateSigmaSq, opt.phi, opt.kappa,
+diff --git a/scr/model.cpp b/scr/model.cpp
+index 0b5c5f1..7c89bde 100644
+--- a/scr/model.cpp
++++ b/scr/model.cpp
+@@ -7,6 +7,9 @@
+ //
+ 
+ #include "model.hpp"
++#include "sbrc_gpu.hpp"
++#include <chrono>
++#include <cstdlib>
+ 
+ 
+ void BayesC::FixedEffects::sampleFromFC(VectorXf &ycorr, const MatrixXf &X,
+@@ -4391,10 +4394,72 @@ void ApproxBayesR::SnpEffects::sampleFromFC_full(VectorXf &rcorr, const vector<V
+     pip = VectorXf::Map(pipPtr, size);
+ }
+ 
++ApproxBayesR::SnpEffects::~SnpEffects() {
++    // Release GPU state on destruction so the d_Q refcount drops and the device
++    // buffer is freed when the last referencing model is gone. Required for
++    // MultiModelSBayesR (findBestFitModel) to not OOM the H100 at full Imputed.
++    if (sbrc_gpu_enabled) sbrc_gpu_release((const void*)this);
++}
++
++ApproxBayesRC::SnpEffects::~SnpEffects() {
++    if (sbrc_gpu_enabled) sbrc_gpu_release((const void*)this);
++}
++
+ void ApproxBayesR::SnpEffects::sampleFromFC_eigen(vector<VectorXf> &wcorrBlocks, const vector<MatrixXf> &Qblocks, vector<VectorXf> &whatBlocks,
+                                             const vector<LDBlockInfo*> &keptLdBlockInfoVec, const VectorXf &nGWASblocks, const VectorXf &vareBlocks,
+                                             const float sigmaSq, const VectorXf &pis, const VectorXf &gamma, VectorXf &snpStore, const float varg,
+                                             const bool hsqPercModel, DeltaPi &deltaPi) {
++    // Phase 2 milestone-3b: GPU hook for ApproxBayesR (pass-1 sampler).
++    // CHR22 validation: ✅ matches CPU within MC noise (8.6% → 35.4% non-zero β after
++    // fixing snpStore[0] aggregation).
++    // FULL-IMPUTED validation: ❌ findBestFitModel creates ~20 model instances across
++    // 4 eigen-cutoffs × 4-5 model variants. Each instance allocates ~500 MB of per-call
++    // state on the H100, accumulating to >10 GB on top of the 70 GB Q matrix. Repeated
++    // eviction during the multi-model OMP-parallel loop also races on g_sbrc_states.
++    // Until that's properly thread-safe with reference counting, leave R on CPU at
++    // full-Imputed scale. Set SBRC_GPU_R=1 to opt in for chr22-style tests.
++    static const bool s_enable_r_hook = []() {
++        const char* e = std::getenv("SBRC_GPU_R");
++        return e && std::atoi(e) != 0;
++    }();
++    if (sbrc_gpu_enabled && s_enable_r_hook) {
++        int ndist_int = (int)pis.size();
++        if (badSnps.size() != (long)size) {
++            VectorXi tmp = VectorXi::Zero(size);
++            if (badSnps.size() > 0) tmp.head(badSnps.size()) = badSnps;
++            badSnps = tmp;
++        }
++        // Build uniform snpPi (every row = pis); kernel takes per-SNP layout.
++        MatrixXf snpPi_uniform(size, ndist_int);
++        for (int k = 0; k < ndist_int; ++k) snpPi_uniform.col(k).setConstant(pis(k));
++
++        MatrixXf gpu_z, gpu_deltaPi;
++        VectorXf gpu_fcMean;
++        ArrayXf gpu_numSnpMix;
++        float gpu_sumSq = 0.0f;
++
++        sbrc_gpu_dispatch_sample_from_fc_eigen(
++            (const void*)this,
++            wcorrBlocks, Qblocks, whatBlocks,
++            keptLdBlockInfoVec, nGWASblocks, vareBlocks,
++            snpPi_uniform, gamma, varg, hsqPercModel, sigmaSq,
++            ndist_int, (int)size,
++            badSnps,
++            values, pip, membership, gpu_z, gpu_fcMean,
++            gpu_sumSq, wtdSumSq, numNonZeros,
++            nnzPerBlk, ssqBlocks, gpu_numSnpMix, snpset,
++            gpu_deltaPi);
++
++        if (sbrc_gpu_caller_ok((const void*)this)) {
++            snpStore = gpu_numSnpMix.matrix();
++            for (int k = 0; k < ndist_int; ++k) {
++                deltaPi[k]->values = gpu_deltaPi.col(k);
++            }
++            return;
++        }
++        // else: GPU dispatch fell back (OOM) — drop through to CPU path
++    }
++
+     // -----------------------------------------
+     // This method uses low-rank model with eigen-decomposition of LD matrices
+     // -----------------------------------------
+@@ -5950,6 +6015,37 @@ void ApproxBayesRC::SnpEffects::sampleFromFC_eigen(vector<VectorXf> &wcorrBlocks
+                                              const vector<LDBlockInfo*> &keptLdBlockInfoVec, const VectorXf &nGWASblocks, const VectorXf &vareBlocks,
+                                              const MatrixXf &snpPi, const VectorXf &gamma, const float varg,
+                                              DeltaPi &deltaPi, const bool hsqPercModel, const float sigmaSq){
++    // -----------------------------------------
++    // Phase 2 milestone-1: GPU dispatch hook
++    // -----------------------------------------
++    if (sbrc_gpu_enabled) {
++        MatrixXf deltaPi_packed;
++        // Ensure badSnps has the right size (CPU caller initializes lazily)
++        if (badSnps.size() != (long)size) {
++            VectorXi tmp = VectorXi::Zero(size);
++            if (badSnps.size() > 0) tmp.head(badSnps.size()) = badSnps;
++            badSnps = tmp;
++        }
++        sbrc_gpu_dispatch_sample_from_fc_eigen(
++            (const void*)this,
++            wcorrBlocks, Qblocks, whatBlocks,
++            keptLdBlockInfoVec, nGWASblocks, vareBlocks,
++            snpPi, gamma, varg, hsqPercModel, sigmaSq,
++            (int)ndist, (int)size,
++            badSnps,
++            values, pip, membership, z, fcMean,
++            sumSq, wtdSumSq, numNonZeros,
++            nnzPerBlk, ssqBlocks, numSnpMix, snpset,
++            deltaPi_packed);
++        if (sbrc_gpu_caller_ok((const void*)this)) {
++            for (unsigned k = 0; k < ndist; ++k) {
++                deltaPi[k]->values = deltaPi_packed.col(k);
++            }
++            return;
++        }
++        // else: GPU dispatch fell back (OOM) — drop through to CPU path
++    }
++
+     // -----------------------------------------
+     // This method uses low-rank model with eigen-decomposition of LD matrices
+     // -----------------------------------------
+@@ -6575,11 +6671,26 @@ void ApproxBayesRC::SnpEffects::sampleFromTGS_eigen(vector<VectorXf> &wcorrBlock
+ }
+ 
+ 
++// Per-stage cumulative timing for AnnoEffects::sampleFromFC_Gibbs (printed at exit)
++static struct AnnoTiming {
++    double subset = 0, latent = 0, gemv_y = 0, gibbs = 0, snpP = 0, total = 0;
++    int calls = 0;
++    ~AnnoTiming() {
++        if (calls == 0) return;
++        std::fprintf(stderr, "\n[anno_gibbs] %d calls\n", calls);
++        std::fprintf(stderr, "  row-subset:        %.2f s  (avg %.3f s/call)\n", subset, subset/calls);
++        std::fprintf(stderr, "  latent (truncN):   %.2f s  (avg %.3f s/call)\n", latent, latent/calls);
++        std::fprintf(stderr, "  GEMV y = A*α:      %.2f s  (avg %.3f s/call)\n", gemv_y, gemv_y/calls);
++        std::fprintf(stderr, "  Gibbs sweep (α):   %.2f s  (avg %.3f s/call)\n", gibbs, gibbs/calls);
++        std::fprintf(stderr, "  snpP = Φ(A*α):     %.2f s  (avg %.3f s/call)\n", snpP, snpP/calls);
++        std::fprintf(stderr, "  total:             %.2f s  (avg %.3f s/call)\n", total, total/calls);
++    }
++} g_anno_timing;
++
+ void ApproxBayesRC::AnnoEffects::sampleFromFC_Gibbs(MatrixXf &z, const MatrixXf &annoMat, const VectorXf &sigmaSq, MatrixXf &snpP) {
+-//    cout << "sampling anno effects..." << endl;
+-    
+-//    static unsigned iter=0;
+-    
++    auto t0 = std::chrono::steady_clock::now();
++    auto stage_now = std::chrono::steady_clock::now;
++
+     VectorXf numOnes(numComp);
+     #pragma omp parallel for schedule(dynamic)
+     for (unsigned i=0; i<numComp; ++i) {
+@@ -6639,17 +6750,33 @@ void ApproxBayesRC::AnnoEffects::sampleFromFC_Gibbs(MatrixXf &z, const MatrixXf
+             }
+ 
+             // compute the mean of truncated normal distribution
++            auto t_g0 = stage_now();
+             VectorXf mean = annoMati * alphai;
+-
+-            // sample latent variables
+-            for (unsigned j=0; j<numDP; ++j) {
+-                //            cout << j << " mean[j] " << mean[j] << " anno " << annoMati.row(j) << endl;
+-                if (zi[j]) y[j] = TruncatedNormal::sample_lower_truncated(mean[j], 1.0, 0.0);
+-                else y[j] = TruncatedNormal::sample_upper_truncated(mean[j], 1.0, 0.0);
++            g_anno_timing.gemv_y += std::chrono::duration<double>(stage_now() - t_g0).count();
++
++            // sample latent variables — M3a-2: GPU path for i==0 case only (full annoMat).
++            // For i>0 the annoMati is a row-subset (annoMatPO); keep that on CPU until
++            // the gather-on-GPU port lands.
++            auto t_l0 = stage_now();
++            bool did_gpu_latent = false;
++            if (sbrc_gpu_enabled && i == 0) {
++                // GPU path: y = TruncN(mean, 1, 0) - mean, in one kernel + GEMV.
++                // The dispatch recomputes mean internally (we don't pass our mean in).
++                VectorXf y_gpu;
++                did_gpu_latent = sbrc_gpu_anno_gemv_latent_apply(
++                    (const void*)this, annoMat, alphai, zi, y_gpu);
++                if (did_gpu_latent) {
++                    y = y_gpu;   // y is already z - mean
++                }
+             }
+-
+-            // adjust the latent variable by all annotation effects;
+-            y -= mean;
++            if (!did_gpu_latent) {
++                for (unsigned j=0; j<numDP; ++j) {
++                    if (zi[j]) y[j] = TruncatedNormal::sample_lower_truncated(mean[j], 1.0, 0.0);
++                    else y[j] = TruncatedNormal::sample_upper_truncated(mean[j], 1.0, 0.0);
++                }
++                y -= mean;
++            }
++            g_anno_timing.latent += std::chrono::duration<double>(stage_now() - t_l0).count();
+ 
+             // intercept is fitted with a flat prior
+             float oldSample = alphai[0];
+@@ -6664,31 +6791,62 @@ void ApproxBayesRC::AnnoEffects::sampleFromFC_Gibbs(MatrixXf &z, const MatrixXf
+             // shuffle the annotations
+             vector<int> shuffled_index = Gadget::shuffle_index(1, numAnno-1);
+ 
++            auto t_b0 = stage_now();
+             ssq[i] = 0;
+-           //for (unsigned k=1; k<numAnno; ++k) {
+-            for (unsigned t=0; t<shuffled_index.size(); ++t) {
+-                unsigned k = shuffled_index[t];
+-                oldSample = alphai[k];
+-                rhs = annoMati.col(k).dot(y) + annoDiagi[k]*oldSample;
+-                invLhs = 1.0/(annoDiagi[k] + 1.0/sigmaSq[i]);
+-                ahat = invLhs*rhs;
+-                alphai[k] = Normal::sample(ahat, invLhs);
+-                y += annoMati.col(k) * (oldSample - alphai[k]);
+-                ssq[i] += alphai[k] * alphai[k];
+-                //            cout << i << " " << k << " " << alphai[k] << " " << ahat << " " << invLhs << " " << annoDiagi[k] << " " << sigmaSq[i] << endl;
++            // M3a-3 v4: cuBLAS-driven Gibbs sweep for component i==0. Pre-consume
++            // GCTB's snorm() so the chain matches CPU semantics modulo FP noise.
++            // Gated behind SBRC_GPU_GIBBS=1.
++            bool did_gpu_gibbs = false;
++            static const bool s_gibbs_enabled = []() {
++                const char* e = std::getenv("SBRC_GPU_GIBBS");
++                return e && std::atoi(e) != 0;
++            }();
++            if (sbrc_gpu_enabled && s_gibbs_enabled && i == 0) {
++                std::vector<float> nrnd_h(shuffled_index.size());
++                for (size_t t = 0; t < shuffled_index.size(); ++t) nrnd_h[t] = (float)Stat::snorm();
++                float ssq_gpu = 0.0f;
++                did_gpu_gibbs = sbrc_gpu_anno_gibbs_sweep_apply(
++                    (const void*)this, annoMat, y, alphai, annoDiagi,
++                    (float)sigmaSq[i],
++                    shuffled_index, nrnd_h, ssq_gpu);
++                if (did_gpu_gibbs) ssq[i] = ssq_gpu;
++            }
++            if (!did_gpu_gibbs) {
++                for (unsigned t=0; t<shuffled_index.size(); ++t) {
++                    unsigned k = shuffled_index[t];
++                    oldSample = alphai[k];
++                    rhs = annoMati.col(k).dot(y) + annoDiagi[k]*oldSample;
++                    invLhs = 1.0/(annoDiagi[k] + 1.0/sigmaSq[i]);
++                    ahat = invLhs*rhs;
++                    alphai[k] = Normal::sample(ahat, invLhs);
++                    y += annoMati.col(k) * (oldSample - alphai[k]);
++                    ssq[i] += alphai[k] * alphai[k];
++                }
+             }
++            g_anno_timing.gibbs += std::chrono::duration<double>(stage_now() - t_b0).count();
+         }
+-        //cout << i << " " << alphai.transpose() << endl;
+-        
+-        #pragma omp parallel for schedule(dynamic)
+-        for (unsigned j=0; j<numSnps; ++j) {
+-            snpP(j,i) = Normal::cdf_01(annoMat.row(j).dot(alphai));
++
++        auto t_p0 = stage_now();
++        // Milestone-3a: GPU path for snpP[:,i] = Φ(annoMat * alphai). Falls back to CPU
++        // if --use-gpu off, OOM, or any cuBLAS failure.
++        VectorXf snpP_col_gpu;
++        bool did_gpu = false;
++        if (sbrc_gpu_enabled) {
++            did_gpu = sbrc_gpu_anno_snpP_apply((const void*)this, annoMat, alphai, snpP_col_gpu);
++        }
++        if (did_gpu) {
++            snpP.col(i) = snpP_col_gpu;
++        } else {
++            #pragma omp parallel for schedule(dynamic)
++            for (unsigned j=0; j<numSnps; ++j) {
++                snpP(j,i) = Normal::cdf_01(annoMat.row(j).dot(alphai));
++            }
+         }
++        g_anno_timing.snpP += std::chrono::duration<double>(stage_now() - t_p0).count();
+     }
+-//    ++iter;
+-    
+-//    cout << "sampling anno effects finished." << endl;
+ 
++    g_anno_timing.total += std::chrono::duration<double>(stage_now() - t0).count();
++    g_anno_timing.calls += 1;
+ }
+ 
+ void ApproxBayesRC::AnnoEffects::sampleFromFC_MH(MatrixXf &z, const MatrixXf &annoMat, const VectorXf &sigmaSq, MatrixXf &snpP) {
+diff --git a/scr/model.hpp b/scr/model.hpp
+index 6533e99..117551a 100644
+--- a/scr/model.hpp
++++ b/scr/model.hpp
+@@ -102,6 +102,9 @@ public:
+     
+     virtual void sampleUnknowns(const unsigned iter) = 0;
+     virtual void sampleStartVal(void) = 0;
++    virtual ~Model() = default;   // Required for `delete (Model*)derived` to fire derived
++                                  // destructors. Pre-existing UB in upstream GCTB; needed
++                                  // for our SnpEffects dtor (GPU release) to run.
+ };
+ 
+ 
+@@ -1675,6 +1678,8 @@ public:
+             wtdSumSq = 0.0;
+             deltaNZ.setZero(size);
+         }
++        ~SnpEffects();   // non-virtual: avoid adding vptr to objects that weren't polymorphic
++                         // (base ParamSet has no vtable). Releases GPU state if --use-gpu active.
+         
+         void sampleFromFC_sparse(VectorXf &rcorr, const vector<SparseVector<float> > &ZPZsp, const VectorXf &ZPZdiag, const VectorXf &ZPy,
+                           const vector<ChromInfo*> &chromInfoVec,
+@@ -2124,13 +2129,17 @@ public:
+         MatrixXf z;
+         vector<vector<unsigned> > snpset;
+         VectorXf fcMean;
+-        
++        void* gpu_state;   // SbrcGpuSampler* opaque pointer; set up lazily on first --use-gpu call
++
+         SnpEffects(const vector<string> &header, const VectorXf &pis): ApproxBayesR::SnpEffects(header){
+             ndist = pis.size();
+             numSnpMix.setZero(ndist);
+             z.setZero(size, ndist-1);
+             fcMean.setZero(size);
++            gpu_state = nullptr;
+         }
++        ~SnpEffects();   // non-virtual; sbrc_gpu_release is idempotent so double-call from R's
++                         // dtor + RC's dtor is safe.
+         
+         void sampleFromFC_sparse(VectorXf &rcorr, const vector<SparseVector<float> > &ZPZsp, const VectorXf &ZPZdiag, const VectorXf &ZPy,
+                                  const vector<ChromInfo*> &chromInfoVec,
+diff --git a/scr/options.cpp b/scr/options.cpp
+index df842e6..cd8ffc2 100644
+--- a/scr/options.cpp
++++ b/scr/options.cpp
+@@ -514,6 +514,10 @@ void Options::inputOptions(const int argc, const char* argv[]){
+             multiThreadEigen = true;
+             ss << "--multi-thread-eigen " << "\n";
+         }
++        else if (!strcmp(argv[i], "--use-gpu")) {
++            useGpu = true;
++            ss << "--use-gpu\n";
++        }
+         else if (!strcmp(argv[i], "--chisq")) {
+             chisqThreshold = atof(argv[++i]);
+             ss << "--chisq " << argv[i] << "\n";
+diff --git a/scr/options.hpp b/scr/options.hpp
+index 099cb1f..8ef0a29 100644
+--- a/scr/options.hpp
++++ b/scr/options.hpp
+@@ -112,6 +112,7 @@ public:
+     bool nDistAuto;  // automatically determine the number of mixture distributions
+     bool writeWandQ; // output w and Q in text format
+     bool estimateRsqEnrich;  // estimate prediction R2 enrichment
++    bool useGpu;             // dispatch ApproxBayesRC::sampleFromFC_eigen to GPU kernel (Phase 2)
+     
+     string eigCutMethod = "value";
+     float eigThreshold = 0.001;
+@@ -264,6 +265,7 @@ public:
+         nDistAuto               = false;
+         writeWandQ              = false;
+         estimateRsqEnrich       = false;
++        useGpu                  = false;
+         
+         title                   = "gctb";
+         analysisType            = "Bayes";

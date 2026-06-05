@@ -1,0 +1,153 @@
+// sbrc_gpu.hpp — Phase 2 GPU dispatch hook for ApproxBayesRC::SnpEffects::sampleFromFC_eigen
+//
+// Public surface is a single free function and a global enable flag, so model.hpp / model.cpp
+// don't need to know CUDA or our state class. The state class (SbrcGpuImpl) lives entirely
+// inside sbrc_gpu.cu and is keyed off the caller's `this` pointer.
+
+#pragma once
+
+#include <Eigen/Core>
+#include <Eigen/Dense>
+#include <vector>
+#include <cstdint>
+
+using Eigen::MatrixXf;
+using Eigen::VectorXf;
+using Eigen::VectorXi;
+using Eigen::ArrayXf;
+
+class LDBlockInfo;     // fwd-decl from data.hpp
+
+// Global enable flag; set from Options::useGpu in main()/GCTB::run.
+extern bool sbrc_gpu_enabled;
+
+// Release the persistent GPU state for a caller. Called from SnpEffects destructor.
+// After release, the next dispatch for this caller_id (if any) will re-init.
+// Also decrements the d_Q reference count; the d_Q buffer is freed when no callers
+// reference it. Safe to call when sbrc_gpu_enabled is false (no-op).
+void sbrc_gpu_release(const void* caller_identity);
+
+// Dispatch the SBayesRC eigen-block Gibbs sweep to GPU.
+// Reproduces ApproxBayesRC::SnpEffects::sampleFromFC_eigen (model.cpp:5949) distributionally.
+//
+// `caller_identity` is used to key persistent GPU state across iterations (Q upload happens
+// once on first call for a given caller; subsequent calls reuse the device buffers).
+// Pass `this` from the SnpEffects member function.
+//
+// In/out semantics match the CPU function. After return, the following are written:
+//   - beta (length m)
+//   - pip (length m)
+//   - membership (length m)
+//   - z (m × ndist-1)
+//   - fcMean (length m)             [milestone-1: left zero]
+//   - sumSq, wtdSumSq, numNonZeros  (scalars)
+//   - nnzPerBlk, ssqBlocks          (length nBlocks)
+//   - numSnpMix                     (length ndist)
+//   - snpset[k]                     (per-component SNP index lists)
+//   - wcorrBlocks, whatBlocks       (per-block q-vectors)
+//   - deltaPi_values (m × ndist)    [packed; caller routes to deltaPi[k]->values]
+void sbrc_gpu_dispatch_sample_from_fc_eigen(
+    const void* caller_identity,
+    std::vector<VectorXf>& wcorrBlocks,
+    const std::vector<MatrixXf>& Qblocks,
+    std::vector<VectorXf>& whatBlocks,
+    const std::vector<LDBlockInfo*>& keptLdBlockInfoVec,
+    const VectorXf& nGWASblocks,
+    const VectorXf& vareBlocks,
+    const MatrixXf& snpPi,
+    const VectorXf& gamma,
+    float varg,
+    bool hsqPercModel,
+    float sigmaSq,
+    int ndist,
+    int totalSnps,
+    const VectorXi& badSnps,   // length m; SNPs with badSnps[i]!=0 are forced to β=0 and skipped
+    // outputs:
+    VectorXf& values,          // β
+    VectorXf& pip,
+    VectorXi& membership,
+    MatrixXf& z,               // m × (ndist-1)
+    VectorXf& fcMean,
+    float& sumSq,
+    float& wtdSumSq,
+    unsigned& numNonZeros,
+    VectorXf& nnzPerBlk,
+    VectorXf& ssqBlocks,
+    ArrayXf& numSnpMix,
+    std::vector<std::vector<unsigned>>& snpset,
+    MatrixXf& deltaPi_values   // packed m × ndist
+);
+
+// Returns true if the most recent dispatch for this caller succeeded on GPU,
+// false if it fell back to CPU (e.g., OOM). Caller can use this to decide
+// whether to run the CPU path instead.
+bool sbrc_gpu_caller_ok(const void* caller_identity);
+
+// Milestone-3a: GPU-accelerate the snpP = Φ(annoMat * α) update in
+// ApproxBayesRC::AnnoEffects::sampleFromFC_Gibbs.
+//
+// Replaces the OMP for-loop:
+//   for (j=0..numSnps) snpP(j,i) = Normal::cdf_01(annoMat.row(j).dot(alphai));
+//
+// Uploads annoMat once per (anno_caller_identity, numComp) — the matrix is constant
+// across MCMC iterations. Per-call: uploads alphai (numAnno floats); runs cuBLAS sgemv
+// + elementwise normal-CDF kernel; downloads snpP_col (numSnps floats).
+//
+// Returns true on success, false on OOM (caller falls back to CPU path).
+bool sbrc_gpu_anno_snpP_apply(
+    const void* anno_caller_identity,
+    const MatrixXf& annoMat,        // m × numAnno (col-major)
+    const VectorXf& alphai,         // numAnno
+    VectorXf& snpP_col);            // out: numSnps
+
+// Release per-caller anno state. Called from AnnoEffects destructor if present.
+void sbrc_gpu_anno_release(const void* anno_caller_identity);
+
+// Milestone-3a-3: GPU-accelerate the 188-annotation Gibbs sweep in
+// AnnoEffects::sampleFromFC_Gibbs.
+//
+// Replaces this CPU block:
+//   for t in 0..numAnno-1:
+//     k = shuffled_index[t]
+//     oldSample = alphai[k]
+//     rhs = annoMati.col(k).dot(y) + annoDiagi[k]*oldSample
+//     invLhs = 1 / (annoDiagi[k] + 1/sigmaSq[i])
+//     alphai[k] = Normal(invLhs*rhs, invLhs)
+//     y += annoMati.col(k) * (oldSample - alphai[k])
+//     ssq[i] += alphai[k]²
+//
+// Serial Gauss-Seidel over annotations. One CUDA threadblock processes the full sweep
+// with parallel dot-product + axpy across length-m y vector.
+// i==0 case only (full annoMat); i>0 falls back to CPU.
+//
+// Returns true on success.
+// shuffled_idx and nrnd MUST be generated by the caller using GCTB's RNG (snorm())
+// so the GPU chain matches the CPU chain trajectory bit-identically modulo FP noise.
+// shuffled_idx.size() and nrnd.size() must both equal numAnno-1.
+bool sbrc_gpu_anno_gibbs_sweep_apply(
+    const void* anno_caller_identity,
+    const MatrixXf& annoMat,         // m × numAnno
+    VectorXf& y,                     // in/out: m
+    VectorXf& alphai,                // in/out: numAnno
+    const VectorXf& annoDiagi,       // numAnno
+    float sigmaSq_i,
+    const std::vector<int>& shuffled_idx,   // length numAnno-1, values in [1, numAnno-1]
+    const std::vector<float>& nrnd,         // length numAnno-1, snorm() draws
+    float& ssq_out);                 // out: sum of alphai[k]² for k in 1..numAnno-1
+
+// Milestone-3a-2: GPU-accelerate the GEMV + latent variable generation step in
+// AnnoEffects::sampleFromFC_Gibbs (component i == 0 case only).
+//
+// Replaces this CPU block:
+//   VectorXf mean = annoMat * alphai;
+//   for j in 0..m: y[j] = TruncN(mean[j], 1, 0, sign by zi[j]);
+//   y -= mean;
+//
+// Returns true on success. Only supports the i==0 case (annoMati = full annoMat,
+// numDP = numSnps). For i>0 (row-subsetted annoMatPO) the caller falls back to CPU.
+bool sbrc_gpu_anno_gemv_latent_apply(
+    const void* anno_caller_identity,
+    const MatrixXf& annoMat,        // m × numAnno (col-major)
+    const VectorXf& alphai,         // numAnno
+    const VectorXf& zi,             // m: 0/1 flags
+    VectorXf& y);                   // out: m

@@ -1,0 +1,28 @@
+# Build artifacts
+*.o
+*.so
+gctb
+gctb_*
+results/
+*.snpRes
+*.lcs
+*.gcs
+*.mcmcsamples/
+*.skepticalSNPs
+
+# Data (LD references, sumstats — usually too big for git)
+data/
+ukbEUR_*/
+
+# Logs
+*.log
+slurm-*.out
+slurm-*.err
+
+# Build dependencies
+boost*/
+eigen*/
+
+# Editor
+*.swp
+.DS_Store
