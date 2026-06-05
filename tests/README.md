@@ -24,10 +24,9 @@ tests/test_docker_build.sh
 
 ## CI
 
-Run locally via the three scripts above. A GitHub Actions workflow can be added
-later (requires a PAT with `workflow` scope or commit it from the GitHub web UI).
-A drop-in workflow YAML for `.github/workflows/ci.yml` is recorded in
-[`CONTRIBUTING.md`](../CONTRIBUTING.md).
+All three run on every push and PR via [.github/workflows/ci.yml](../.github/workflows/ci.yml).
+The Docker build only runs when `src/` or `docs/Dockerfile` change (to keep PR
+cycle time down for README/script edits).
 
 ## GPU-required tests
 

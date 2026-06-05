@@ -54,49 +54,10 @@ When adding a new kernel:
 
 See [`tests/README.md`](tests/README.md).
 
-## Drop-in GitHub Actions workflow
+## CI
 
-Pushing a `.github/workflows/*.yml` requires a PAT with `workflow` scope. If you
-have one, paste this YAML into `.github/workflows/ci.yml`:
-
-```yaml
-name: ci
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-jobs:
-  patch-applies:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: tests/test_patch_applies.sh
-  compare-pip-nan:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y g++
-      - run: g++ -O3 -ffast-math -std=c++17 -o tests/test_compare_pip_nan tests/test_compare_pip_nan.cpp
-      - run: ./tests/test_compare_pip_nan
-  shellcheck:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: shellcheck tests/*.sh
-  docker-build:
-    runs-on: ubuntu-22.04
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      contains(toJSON(github.event.commits.*.modified), 'docs/Dockerfile') ||
-      contains(toJSON(github.event.commits.*.modified), 'src/')
-    steps:
-      - uses: actions/checkout@v4
-      - env: { GPU_ARCH: sm_80 }
-        run: tests/test_docker_build.sh
-```
+CI runs on GitHub Actions: see [.github/workflows/ci.yml](.github/workflows/ci.yml).
+Updating that file requires a PAT with `workflow` scope (in addition to `repo`).
 
 ## Branch / commit conventions
 

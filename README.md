@@ -1,5 +1,7 @@
 # sbayesrc-gpu
 
+[![ci](https://github.com/ryo1024/sbayesrc-gpu/actions/workflows/ci.yml/badge.svg)](https://github.com/ryo1024/sbayesrc-gpu/actions/workflows/ci.yml)
+
 GPU-accelerated [SBayesRC](https://doi.org/10.1038/s41588-024-01704-y) fine-mapping
 via a minimally-invasive patch on top of [GCTB](https://github.com/jianzeng/GCTB).
 
