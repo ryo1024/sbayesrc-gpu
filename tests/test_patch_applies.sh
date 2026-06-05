@@ -21,7 +21,10 @@ if [ ! -f "$patch_file" ]; then
 fi
 
 work_dir="$(mktemp -d)"
-trap "rm -rf '$work_dir'" EXIT
+# Expand $work_dir now (it's already set), but use single quotes so shellcheck
+# stays happy about late expansion in the trap body.
+cleanup() { rm -rf "$work_dir"; }
+trap cleanup EXIT
 
 echo "Cloning GCTB@${GCTB_SHA} into $work_dir ..."
 git clone --quiet --no-tags "$GCTB_URL" "$work_dir/GCTB"
