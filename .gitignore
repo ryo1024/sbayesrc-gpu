@@ -10,8 +10,9 @@ results/
 *.mcmcsamples/
 *.skepticalSNPs
 
-# Data (LD references, sumstats — usually too big for git)
-data/
+# Data (LD references, sumstats — usually too big for git).
+# The /data/ form anchors at the repo root so tests/data/ stays tracked.
+/data/
 ukbEUR_*/
 
 # Logs
