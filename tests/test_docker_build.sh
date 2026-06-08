@@ -29,4 +29,15 @@ echo "Building $IMAGE_TAG with GPU_ARCH=$GPU_ARCH ..."
 echo "Verifying gctb binary exists in image ..."
 "$DOCKER" run --rm "$IMAGE_TAG" sh -c 'test -x /usr/local/bin/gctb && /usr/local/bin/gctb 2>&1 | head -5'
 
+# If the host has a GPU, run the full end-to-end pipeline inside the image too.
+# Skipped when --gpus all is unavailable (e.g. CI runners without GPUs).
+if "$DOCKER" run --gpus all --rm "$IMAGE_TAG" nvidia-smi -L >/dev/null 2>&1; then
+    echo "Running end-to-end GPU smoke inside the image ..."
+    "$DOCKER" run --gpus all --rm \
+        -v "${repo_root}:/work" -w /work \
+        "$IMAGE_TAG" tests/test_e2e_gpu.sh
+else
+    echo "Skipping in-image e2e smoke (no GPU available to the docker daemon)."
+fi
+
 echo "PASS: docker image $IMAGE_TAG built and gctb binary present."

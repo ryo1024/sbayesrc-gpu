@@ -1,11 +1,12 @@
 # Tests
 
-Three test suites, ordered by speed:
+Four test suites, ordered by speed:
 
 | Test | Runtime | GPU? | What it catches |
 | --- | --- | --- | --- |
 | `test_compare_pip_nan` | <1 s | no | Comparator regressions where `-ffast-math` strips NaN handling and post-MCMC `std::sort` would crash. |
 | `test_patch_applies.sh` | ~5 s | no | Upstream GCTB moved and the patch no longer applies cleanly to the pinned SHA. |
+| `test_e2e_gpu.sh` | ~5 s on H100 | **yes** | End-to-end pipeline: builds LD eigen-decomp from vendored chr22 BED, generates synthetic .ma + annot, runs the GPU MCMC, checks the snpRes output. Skips with exit 0 if no nvidia-smi is on PATH. |
 | `test_docker_build.sh` | ~5-10 min | no (at build time) | Patch+build pipeline regressions; missing toolchain deps; nvcc compile errors. |
 
 ## Running locally
@@ -18,7 +19,12 @@ g++ -O3 -ffast-math -std=c++17 -o tests/test_compare_pip_nan tests/test_compare_
 # 2. Patch-applies check (needs git + internet)
 tests/test_patch_applies.sh
 
-# 3. Full Docker build (slow; needs docker)
+# 3. End-to-end GPU smoke (needs an nvidia GPU + gctb on PATH).
+#    Inside the docker image: docker run --gpus all --rm -v $(pwd):/work -w /work \
+#                                        sbayesrc-gpu tests/test_e2e_gpu.sh
+tests/test_e2e_gpu.sh
+
+# 4. Full Docker build (slow; needs docker)
 tests/test_docker_build.sh
 ```
 
