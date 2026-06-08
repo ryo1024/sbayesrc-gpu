@@ -41,3 +41,19 @@ per-iter speedup ratio.
 
 Pass `SBRC_GPU_R=1 SBRC_GPU_GIBBS=1 SBRC_SKIP_FINDBEST=1` to reproduce the
 5.04× headline speedup.
+
+## Full scaling plot
+
+![Full scaling plot](scaling_full.png)
+
+The same HM3 1.15M-SNP scaling sweep as in the README, with the multi-chain
+sub-sweep overlaid as open-marker dashed lines:
+
+- **Solid lines** — single chain, varying length (the simple plot in the
+  README). GPU per-iter ≈ 0.7 s, CPU per-iter ≈ 1.7 s, gap grows as setup
+  amortizes.
+- **Open markers (length=500, vary chains)** — GPU wall stays nearly flat
+  (528 → 692 s, +31%) from 1 to 8 chains because all chains share one
+  refcounted `d_annoMat` device buffer. CPU jumps to ~2300 s at 2+ chains
+  and plateaus there. **More chains → bigger GPU advantage**: 2.7× at 1
+  chain, 4.4× at 2 chains, 3.4× at 8 chains.

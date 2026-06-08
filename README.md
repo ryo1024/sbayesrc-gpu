@@ -92,21 +92,17 @@ filesystem layout and cluster QoS.
 
 ## Scaling
 
-The plot at the top is from the HM3 1.15M-SNP reference at multiple chain
-configurations. Two ways to read it:
+The plot at the top is the single-chain length sweep on the HM3 1.15M-SNP
+reference. GPU per-iter cost is ~0.7 s vs CPU ~1.7 s — a steady ~2.5–3×
+per-iter advantage that grows as chain length increases and setup amortizes.
 
-- **Solid lines (single chain, vary length)**: GPU per-iter cost is ~0.7 s
-  vs CPU ~1.7 s — a steady ~2.5–3× per-iter advantage. As chain length grows,
-  setup amortizes and the gap converges to the per-iter speedup.
-- **Open markers (length=500, vary chains)**: GPU wall stays nearly flat
-  (528 → 692 s, +31%) from 1 to 8 chains because all chains share one
-  refcounted `d_annoMat` device buffer. CPU jumps to ~2300 s at 2+ chains
-  and plateaus there. **More chains ⇒ bigger GPU advantage**: 2.7× at 1
-  chain, 4.4× at 2 chains.
+The 5.04× headline at full ukbEUR-Imputed (7M SNPs) is the limit of this
+trend: larger SNP panel → kernels are further from being overhead-bound →
+the per-iter speedup grows.
 
-The 5.04× headline at full ukbEUR-Imputed (7M SNPs) is the limit of this trend:
-larger SNP panel ⇒ the GPU kernels are further from being overhead-bound, so
-per-iter speedup grows even more.
+A multi-chain version of the plot (showing the additional GPU win from
+cross-chain `d_annoMat` sharing) lives in
+[`docs/components.md`](docs/components.md#full-scaling-plot).
 
 Reproduce: [`scripts/scaling_sweep.sh`](scripts/scaling_sweep.sh) +
 [`docs/plot_scaling.py`](docs/plot_scaling.py). Raw measurements:
