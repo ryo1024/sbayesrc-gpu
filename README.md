@@ -125,6 +125,36 @@ Example SLURM scripts (the exact ones we used internally) live in
 [`examples/slurm/`](examples/slurm/) — they need light adaptation to your
 filesystem layout and cluster QoS.
 
+## Scaling
+
+![Scaling plot](docs/scaling.png)
+
+Both panels are on the HM3 1.15M-SNP LD reference, with `A_sbrc` (188-annotation
+baseline-LF) and the full GPU stack enabled (`SBRC_GPU_R=1 SBRC_GPU_GIBBS=1
+SBRC_SKIP_FINDBEST=1`). CPU baseline is upstream GCTB 2.5.5 on a 64-core Xeon
+(16 OMP threads). GPU is one H100 80 GB. The same single-trait inputs are used
+across all points.
+
+**Panel A — chain-length sweep, single chain**: GPU is consistently ~2.5–3× faster
+than CPU, and the per-iter slope is shallower (GPU per-iter ~0.7 s vs CPU ~1.7 s
+at this scale). Setup cost is amortized over more iterations as chain length
+grows, so the gap shape is the classic GPU asymptotic-speedup pattern.
+
+**Panel B — multi-chain sweep at chain-length=500**: the more interesting story.
+GPU wall-time stays nearly flat from 1→8 chains (528 → 692 s, +31%) thanks to
+cross-chain `d_annoMat` sharing — only one 5.5 GB device buffer is allocated
+regardless of how many chains run. CPU jumps from 1435 s at 1 chain to 2300+ s
+at 2+ chains and plateaus there. **The more chains you run, the bigger the GPU
+advantage**: 2.7× at 1 chain → 4.4× at 2 chains → 3.4× at 8 chains.
+
+Headline production numbers at full ukbEUR-Imputed (7M SNPs, 4 chains × 2000
+iter) are in the table at the top of this README — 5.04× because the per-iter
+GPU advantage continues to grow with SNP count.
+
+Reproduce: [`scripts/scaling_sweep.sh`](scripts/scaling_sweep.sh) +
+[`docs/plot_scaling.py`](docs/plot_scaling.py). Raw measurements:
+[`docs/scaling_results.csv`](docs/scaling_results.csv).
+
 ## Memory requirements
 
 - The eigen-LD reference Q matrix for `ukbEUR_Imputed` (7M SNPs, 591 LD blocks) is
