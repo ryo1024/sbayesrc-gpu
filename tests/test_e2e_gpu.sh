@@ -67,12 +67,13 @@ gctb --ldm "${work}/ldm" \
      --gwas-summary "${work}/smoke.ma" \
      --make-ldm-eigen \
      --out "${work}/ldm" >"${work}/step3.log" 2>&1
-if ! ls "${work}/ldm/"*.eigen.bin >/dev/null 2>&1; then
+mapfile -t eigen_files < <(find "${work}/ldm" -maxdepth 1 -name '*.eigen.bin' -print)
+if [ "${#eigen_files[@]}" -eq 0 ]; then
     echo "FAIL: no *.eigen.bin produced. See ${work}/step3.log" >&2
     tail -30 "${work}/step3.log" >&2
     exit 1
 fi
-neigen=$(ls "${work}/ldm/"*.eigen.bin | wc -l | tr -d ' ')
+neigen=${#eigen_files[@]}
 echo "[e2e]   built $neigen eigen-decomp block files"
 
 echo "[e2e] Step 4: run GPU SBayesRC (--gwfm RC --use-gpu, short chain) ..."
