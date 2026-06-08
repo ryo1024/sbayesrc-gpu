@@ -1,13 +1,15 @@
 """
-Render the two-panel scaling plot for the README from a CSV of sweep runs.
+Render the SBayesRC GPU-vs-CPU scaling plot for the README from a CSV of
+sweep runs.
 
 Input CSV columns: impl, chain_length, num_chains, burn_in, wall_seconds.
 Where impl ∈ {"cpu", "gpu"} and wall_seconds is either a float or "FAILED".
 
-Plot A: x = chain_length, y = wall_seconds, lines = {cpu, gpu}.
-        Filtered to num_chains == 1.
-Plot B: x = num_chains, y = wall_seconds, lines = {cpu, gpu}.
-        Filtered to chain_length == 2000.
+Plot: x = total MCMC samples (chain_length × num_chains), y = wall time.
+Solid lines connect the chain-length sweep (num_chains=1) for each impl.
+Open markers show the multi-chain points (num_chains > 1, fixed chain_length),
+which sit BELOW the corresponding longer-single-chain points on GPU because
+of cross-chain d_annoMat sharing.
 
 Usage:
     python docs/plot_scaling.py --csv scaling_results.csv --out docs/scaling.png
@@ -43,65 +45,103 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--title", default="SBayesRC chr22 scaling (1 H100 vs 64-core Xeon)")
+    ap.add_argument("--title", default="SBayesRC scaling: 1× H100 vs 64-core Xeon (HM3, 1.15M SNPs)")
     args = ap.parse_args()
 
     rows = parse_csv(args.csv)
     if not rows:
         raise SystemExit(f"No usable rows in {args.csv}")
 
-    plot_a = sorted([r for r in rows if r["num_chains"] == 1],
-                    key=lambda r: (r["impl"], r["chain_length"]))
-    # Plot B uses whichever chain_length has the most num_chains points (the
-    # one the sweep actually exercised).
-    cl_counts: dict[int, int] = {}
     for r in rows:
-        if r["num_chains"] >= 1:
-            cl_counts[r["chain_length"]] = cl_counts.get(r["chain_length"], 0) + 1
-    plot_b_cl = max(cl_counts, key=lambda cl: cl_counts[cl])
-    plot_b = sorted([r for r in rows if r["chain_length"] == plot_b_cl],
-                    key=lambda r: (r["impl"], r["num_chains"]))
+        r["total_samples"] = r["chain_length"] * r["num_chains"]
 
-    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(11, 4.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(8.5, 5.5), constrained_layout=True)
 
-    colors = {"cpu": "#d65f5f", "gpu": "#5f88d6"}
-    markers = {"cpu": "o", "gpu": "s"}
-    labels = {"cpu": "CPU (64-core Xeon)", "gpu": "GPU (1× H100)"}
+    style = {
+        "cpu": {"color": "#d65f5f", "marker": "o", "label": "CPU (64-core Xeon)"},
+        "gpu": {"color": "#5f88d6", "marker": "s", "label": "GPU (1× H100)"},
+    }
 
+    # --- Main lines: chain-length sweep (num_chains == 1) ---------------------
     for impl in ("cpu", "gpu"):
-        xs = [r["chain_length"] for r in plot_a if r["impl"] == impl]
-        ys = [r["wall_seconds"] for r in plot_a if r["impl"] == impl]
-        if xs:
-            ax_a.plot(xs, ys, color=colors[impl], marker=markers[impl],
-                      label=labels[impl], linewidth=2, markersize=7)
+        line_rows = sorted(
+            [r for r in rows if r["num_chains"] == 1],
+            key=lambda r: r["total_samples"],
+        )
+        line_rows = [r for r in line_rows if r["impl"] == impl]
+        if not line_rows:
+            continue
+        xs = [r["total_samples"] for r in line_rows]
+        ys = [r["wall_seconds"]  for r in line_rows]
+        ax.plot(xs, ys,
+                color=style[impl]["color"],
+                marker=style[impl]["marker"],
+                label=style[impl]["label"],
+                linewidth=2.4, markersize=8.5, alpha=0.95, zorder=3)
 
-    ax_a.set_xlabel("MCMC chain length (iterations)")
-    ax_a.set_ylabel("Wall time (s)")
-    ax_a.set_title("A. Single-chain scaling")
-    ax_a.set_xscale("log")
-    ax_a.set_yscale("log")
-    ax_a.grid(True, which="both", linewidth=0.4, alpha=0.5)
-    ax_a.legend(frameon=False, loc="lower right")
-
+    # --- Multi-chain points (num_chains > 1) ---------------------------------
+    # Plot as open markers + dashed connector. Same colors so they read as
+    # the same impl, but visually distinct so the reader can see "wide vs long".
     for impl in ("cpu", "gpu"):
-        xs = [r["num_chains"] for r in plot_b if r["impl"] == impl]
-        ys = [r["wall_seconds"] for r in plot_b if r["impl"] == impl]
-        if xs:
-            ax_b.plot(xs, ys, color=colors[impl], marker=markers[impl],
-                      label=labels[impl], linewidth=2, markersize=7)
+        multi_rows = sorted(
+            [r for r in rows if r["num_chains"] > 1 and r["impl"] == impl],
+            key=lambda r: r["total_samples"],
+        )
+        if not multi_rows:
+            continue
+        xs = [r["total_samples"] for r in multi_rows]
+        ys = [r["wall_seconds"]  for r in multi_rows]
+        ax.plot(xs, ys,
+                color=style[impl]["color"],
+                marker=style[impl]["marker"],
+                linestyle="--",
+                markerfacecolor="white",
+                markeredgecolor=style[impl]["color"],
+                markeredgewidth=1.8,
+                linewidth=1.4, markersize=9, alpha=0.85, zorder=2)
 
-    ax_b.set_xlabel("Number of MCMC chains")
-    ax_b.set_ylabel("Wall time (s)")
-    ax_b.set_title(f"B. Multi-chain scaling (length={plot_b_cl})")
-    ax_b.grid(True, which="both", linewidth=0.4, alpha=0.5)
-    ax_b.legend(frameon=False, loc="upper left")
+    # --- Annotations: label every point with (chain_length × num_chains) -----
+    for r in rows:
+        tag = f"{r['chain_length']}×{r['num_chains']}"
+        c = style[r["impl"]]["color"]
+        dy = 14 if r["impl"] == "gpu" else -16
+        ax.annotate(tag,
+                    xy=(r["total_samples"], r["wall_seconds"]),
+                    xytext=(0, dy),
+                    textcoords="offset points",
+                    fontsize=7.5, ha="center",
+                    color=c, alpha=0.75)
 
-    fig.suptitle(args.title, fontsize=12)
+    ax.set_xlabel("Total MCMC samples  (chain_length × num_chains)")
+    ax.set_ylabel("Wall time (s)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.grid(True, which="both", linewidth=0.4, alpha=0.5)
+
+    # Custom legend with a third entry for the multi-chain markers.
+    from matplotlib.lines import Line2D
+    legend_handles = [
+        Line2D([0], [0], color=style["cpu"]["color"], marker="o", markersize=8,
+               linewidth=2.4, label="CPU (64-core Xeon)"),
+        Line2D([0], [0], color=style["gpu"]["color"], marker="s", markersize=8,
+               linewidth=2.4, label="GPU (1× H100)"),
+        Line2D([0], [0], color="#555", marker="s", markersize=9,
+               markerfacecolor="white", markeredgecolor="#555",
+               linewidth=0, label="num_chains > 1 (open marker)"),
+    ]
+    ax.legend(handles=legend_handles, frameon=False, loc="lower right")
+    ax.set_title(args.title)
+
+    fig.text(0.5, -0.03,
+             "Solid = single chain, varying length. Open markers = multi-chain at length=500. "
+             "Where the same x has both, going 'wide' is cheaper than going 'long' on GPU.",
+             ha="center", fontsize=8, style="italic", color="#444444")
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=150, bbox_inches="tight")
     print(f"Wrote {args.out}")
 
-    # Also dump a small speedup summary.
+    # Speedup summary table.
     print("\nSpeedup summary:")
     print(f"{'config':<35} {'CPU (s)':>10} {'GPU (s)':>10} {'speedup':>10}")
     by_key = {}
