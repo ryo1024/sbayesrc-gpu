@@ -102,4 +102,77 @@ if [ "$nrow" -lt $((nsnp / 2)) ]; then
     exit 1
 fi
 
-echo "[e2e] PASS: end-to-end GPU pipeline produced a valid snpRes."
+# Numerical regression guard: the chain is short and the inputs are deterministic
+# (fixed-seed synthetic), so summary stats should land in stable, narrow bands.
+# FP non-associativity in cuBLAS reductions + cuRAND seed handling means we
+# can't lock a hash, but we can catch "kernel produced garbage" or "chain
+# diverged to all-NaN / all-zero" without false positives on legitimate noise.
+python3 - "${work}/result.snpRes" <<'PYEOF' || { echo "FAIL: numerical regression check failed" >&2; tail -30 "${work}/step4.log" >&2; exit 1; }
+import math
+import sys
+
+# snpRes is whitespace-delimited with a header line. Parse manually — Python's
+# csv module doesn't accept delimiter=None for variable-width whitespace.
+path = sys.argv[1]
+pip_vals, beta_vals = [], []
+with open(path) as f:
+    header = f.readline().split()
+    if "PIP" not in header or "A1Effect" not in header:
+        print(f"  snpRes header missing PIP / A1Effect: {header}", file=sys.stderr)
+        sys.exit(1)
+    pip_i = header.index("PIP")
+    eff_i = header.index("A1Effect")
+    for line in f:
+        parts = line.split()
+        try:
+            pip = float(parts[pip_i])
+            eff = float(parts[eff_i])
+        except (ValueError, IndexError):
+            continue
+        # NaN/Inf would short-circuit the chain — fail loudly.
+        if not math.isfinite(pip) or not math.isfinite(eff):
+            print(f"  non-finite PIP or effect on line: {line.rstrip()}", file=sys.stderr)
+            sys.exit(1)
+        pip_vals.append(pip)
+        beta_vals.append(eff)
+
+n = len(pip_vals)
+if n < 1000:
+    print(f"  too few SNPs parsed: {n}", file=sys.stderr)
+    sys.exit(1)
+
+# 1. All PIPs in [0, 1].
+if not all(0.0 <= p <= 1.0 for p in pip_vals):
+    bad = [p for p in pip_vals if not (0.0 <= p <= 1.0)][:5]
+    print(f"  PIPs out of [0,1]: examples {bad}", file=sys.stderr)
+    sys.exit(1)
+
+# Use loose bands. The chain runs only 50 iter for a quick smoke and the
+# synthetic signals are weak, so legitimate posteriors can be very small.
+# The goal here is to catch obvious garbage (NaN propagation, "all 1.0",
+# "all exactly 0.0", absurd effect sizes), not to validate convergence.
+
+# 2. Mean PIP not pinned at the extremes.
+mean_pip = sum(pip_vals) / n
+if not (0.0 < mean_pip <= 0.7):
+    print(f"  mean PIP {mean_pip:.6f} outside sanity band (0, 0.7]", file=sys.stderr)
+    sys.exit(1)
+
+# 3. At least one non-trivially positive PIP (chain not stuck at exactly 0).
+max_pip = max(pip_vals)
+if max_pip <= 0.0:
+    print(f"  max PIP {max_pip:.2e} non-positive — chain stuck at 0", file=sys.stderr)
+    sys.exit(1)
+
+# 4. Effect-size RMS finite and not blown up to >1 (PIP-weighted betas
+#    should be small for our weak synthetic signals).
+beta_rms = math.sqrt(sum(b * b for b in beta_vals) / n)
+if not (0.0 <= beta_rms <= 1.0):
+    print(f"  effect-size RMS {beta_rms:.2e} outside sanity band [0, 1]", file=sys.stderr)
+    sys.exit(1)
+
+print(f"  numerical-regression check: mean PIP={mean_pip:.4f}, max PIP={max_pip:.4f}, "
+      f"effect RMS={beta_rms:.2e} — all within bands")
+PYEOF
+
+echo "[e2e] PASS: end-to-end GPU pipeline produced a valid snpRes with sane numerics."

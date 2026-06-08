@@ -30,12 +30,28 @@ A drop-in replacement for the `--gwfm RC` step of GCTB 2.5.5. Same input formats
 - CUDA 12.0+ (tested on CUDA 13.0)
 - Compute capability `sm_80` or `sm_90` (Ampere/Hopper). Set `GPU_ARCH=sm_80` if
   using A100.
-- Eigen 3.4
-- Boost 1.74+ (header-only components: `format`, `math`, `random`, `range`)
+- Eigen 3.4 (headers)
+- Boost 1.74+ (headers — only `format`, `math`, `random`, `range`)
 - GCTB 2.5.5 source from `https://github.com/jianzeng/GCTB`
 - g++ 11+ with C++17 support
 
-### Build
+### One-shot reproducer
+
+The fastest path from a clean checkout to a verified-working GPU binary:
+
+```bash
+EIGEN3_INCLUDE_DIR=/path/to/eigen      \
+BOOST_LIB=/path/to/boost              \
+GPU_ARCH=sm_90                         \
+    scripts/build_and_smoke.sh
+```
+
+It clones GCTB at the pinned SHA, applies the patch, builds with `USE_GPU=1`,
+and runs `tests/test_e2e_gpu.sh` against the freshly-built binary. The whole
+thing takes ~3 minutes (mostly the build). See `scripts/build_and_smoke.sh
+--help` for env knobs.
+
+### Build (manual)
 
 ```bash
 # 1. Clone GCTB source
@@ -50,8 +66,8 @@ cp /path/to/sbayesrc-gpu/src/sbrc_gpu.{cu,hpp} scr/
 
 # 4. Build with GPU support
 cd scr
-export EIGEN3_INCLUDE_DIR=/path/to/eigen-3.4.0
-export BOOST_LIB=/path/to/boost_1_85_0
+export EIGEN3_INCLUDE_DIR=/path/to/eigen
+export BOOST_LIB=/path/to/boost
 make USE_GPU=1 GPU_ARCH=sm_90   # or sm_80 for A100
 
 # Binary: scr/gctb
@@ -59,6 +75,27 @@ make USE_GPU=1 GPU_ARCH=sm_90   # or sm_80 for A100
 
 Or use the Dockerfile (see [`docs/Dockerfile`](docs/Dockerfile)) for a
 reproducible build.
+
+### Building without root (shared clusters)
+
+If you don't have `sudo` / `apt` / `conda`, both deps are header-only — just
+unpack tarballs and point the build at them:
+
+```bash
+# Eigen 3.4
+wget -O eigen-3.4.0.tar.gz \
+    https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz
+tar xzf eigen-3.4.0.tar.gz
+export EIGEN3_INCLUDE_DIR=$PWD/eigen-3.4.0
+
+# Boost (any 1.74+ works; 1.85.0 shown here)
+wget -O boost.tar.gz \
+    https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.gz
+tar xzf boost.tar.gz
+export BOOST_LIB=$PWD/boost_1_85_0
+
+scripts/build_and_smoke.sh
+```
 
 ## How to run
 
