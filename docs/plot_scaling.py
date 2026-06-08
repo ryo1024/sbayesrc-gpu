@@ -113,29 +113,40 @@ def main() -> None:
                     color=c, alpha=0.75)
 
     ax.set_xlabel("Total MCMC samples  (chain_length × num_chains)")
-    ax.set_ylabel("Wall time (s)")
+    ax.set_ylabel("Wall time (seconds)")
     ax.set_xscale("log")
     ax.set_yscale("log")
+
+    # Dense, human-readable y-axis ticks instead of just powers of 10.
+    yticks = [100, 200, 300, 500, 700, 1000, 1500, 2000, 3000, 5000]
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{t}" for t in yticks])
+    ax.minorticks_off()
+    # And x-axis ticks at every actual config x.
+    xticks = sorted({r["total_samples"] for r in rows})
+    ax.set_xticks(xticks)
+    ax.set_xticklabels([f"{t}" for t in xticks])
+
     ax.grid(True, which="both", linewidth=0.4, alpha=0.5)
 
-    # Custom legend with a third entry for the multi-chain markers.
+    # Explicit 4-entry legend so the marker semantics are unambiguous.
     from matplotlib.lines import Line2D
     legend_handles = [
         Line2D([0], [0], color=style["cpu"]["color"], marker="o", markersize=8,
-               linewidth=2.4, label="CPU (64-core Xeon)"),
+               linewidth=2.4, label="CPU — single chain (vary length)"),
         Line2D([0], [0], color=style["gpu"]["color"], marker="s", markersize=8,
-               linewidth=2.4, label="GPU (1× H100)"),
-        Line2D([0], [0], color="#555", marker="s", markersize=9,
-               markerfacecolor="white", markeredgecolor="#555",
-               linewidth=0, label="num_chains > 1 (open marker)"),
+               linewidth=2.4, label="GPU — single chain (vary length)"),
+        Line2D([0], [0], color=style["cpu"]["color"], marker="o", markersize=9,
+               markerfacecolor="white", markeredgecolor=style["cpu"]["color"],
+               markeredgewidth=1.8, linestyle="--", linewidth=1.4,
+               label="CPU — multi-chain (length=500, vary chains)"),
+        Line2D([0], [0], color=style["gpu"]["color"], marker="s", markersize=9,
+               markerfacecolor="white", markeredgecolor=style["gpu"]["color"],
+               markeredgewidth=1.8, linestyle="--", linewidth=1.4,
+               label="GPU — multi-chain (length=500, vary chains)"),
     ]
-    ax.legend(handles=legend_handles, frameon=False, loc="lower right")
+    ax.legend(handles=legend_handles, frameon=False, loc="lower right", fontsize=9)
     ax.set_title(args.title)
-
-    fig.text(0.5, -0.03,
-             "Solid = single chain, varying length. Open markers = multi-chain at length=500. "
-             "Where the same x has both, going 'wide' is cheaper than going 'long' on GPU.",
-             ha="center", fontsize=8, style="italic", color="#444444")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=150, bbox_inches="tight")
